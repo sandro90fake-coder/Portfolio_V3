@@ -274,7 +274,12 @@ tbody tr:hover{background:rgba(255,255,255,.02);}
 
       <!-- Positionen bearbeiten -->
       <div class="infobox warn" style="margin-bottom:14px;">
-        <strong style="color:var(--amber);">Deine Positionen</strong> — trag deine eigenen Bestände ein, dann klicke „Daten laden":
+        <strong style="color:var(--amber);">Deine Positionen</strong> — trag deine Bestände ein, dann klicke „Daten laden".<br>
+        <span style="font-size:12px;color:var(--muted);">
+          Ticker-Format: US-Aktien/ETFs <code style="color:var(--amber);">AAPL · MSFT · VOO · SPY</code> &nbsp;|&nbsp;
+          Krypto <code style="color:var(--amber);">BTC-USD · ETH-USD</code> &nbsp;|&nbsp;
+          Schweizer/europäische Aktien leider nicht im Free-Tier unterstützt.
+        </span>
       </div>
       <div id="positionsForm"></div>
       <button class="btn-add" onclick="addPositionRow()" style="margin-bottom:20px;">+ Position hinzufügen</button>
@@ -374,11 +379,16 @@ tbody tr:hover{background:rgba(255,255,255,.02);}
 const FX_USD_CHF_DEFAULT = 0.902;  // Fallback, wenn FX-Abruf fehlschlägt
 
 // Initialer Portfolioinhalt (wird aus localStorage geladen/überschrieben)
+// Ticker-Format fuer Alpha Vantage Free-Tier:
+// US-Aktien/ETFs: AAPL, MSFT, VOO, QQQ, SPY  (direkt, kein Suffix)
+// Schweizer Aktien: NESN.SW, NOVN.SW          (Yahoo-Format, funktioniert NICHT bei AV Free!)
+// Krypto: BTC-USD, ETH-USD                    (funktioniert mit AV Free)
+// Europaeische ETFs (z.B. VWRL): am besten US-Aequivalent nehmen (VT, VWRA)
 const DEFAULT_POSITIONS = [
-  {ticker:'AAPL',  shares:10,  buyPrice:165.0, buyDate:'2023-03-15', assetClass:'Aktie',  currency:'USD'},
-  {ticker:'MSFT',  shares:6,   buyPrice:290.0, buyDate:'2023-01-10', assetClass:'Aktie',  currency:'USD'},
-  {ticker:'VWRL.L',shares:25,  buyPrice:98.5,  buyDate:'2022-11-01', assetClass:'ETF',    currency:'USD'},
-  {ticker:'BTC-USD',shares:0.1,buyPrice:28000, buyDate:'2023-02-01', assetClass:'Krypto', currency:'USD'},
+  {ticker:'AAPL',   shares:10,  buyPrice:165.0, buyDate:'2023-03-15', assetClass:'Aktie',  currency:'USD'},
+  {ticker:'MSFT',   shares:6,   buyPrice:290.0, buyDate:'2023-01-10', assetClass:'Aktie',  currency:'USD'},
+  {ticker:'VT',     shares:25,  buyPrice:98.5,  buyDate:'2022-11-01', assetClass:'ETF',    currency:'USD'},
+  {ticker:'BTC-USD',shares:0.1, buyPrice:28000, buyDate:'2023-02-01', assetClass:'Krypto', currency:'USD'},
 ];
 
 const STATE = {
@@ -433,23 +443,25 @@ async function avFetch(params){
 }
 
 async function fetchDailyAdjusted(ticker){
-  // Versuche zuerst gecachte Daten
   if(STATE.priceData[ticker]?.length>0) return STATE.priceData[ticker];
-  const data = await avFetch({function:'TIME_SERIES_DAILY_ADJUSTED', symbol:ticker, outputsize:'full'});
-  if(data['Error Message'] || data['Note'] || data['Information']){
-    throw new Error(data['Note'] || data['Information'] || data['Error Message'] || 'API-Fehler');
-  }
+  // TIME_SERIES_DAILY = einziger Free-Tier-kompatibler Tages-Endpoint
+  const data = await avFetch({function:'TIME_SERIES_DAILY', symbol:ticker, outputsize:'full'});
+  if(data['Error Message'])   throw new Error('Unbekannter Ticker: '+ticker);
+  if(data['Information'])     throw new Error('Rate-Limit — 60s warten, dann nochmal klicken');
+  if(data['Note'])            throw new Error('API-Limit erreicht: '+data['Note']);
+  if(!data['Time Series (Daily)']) throw new Error('Keine Daten für '+ticker);
+
   const ts = data['Time Series (Daily)'];
   const arr = Object.entries(ts)
     .sort(([a],[b])=>a.localeCompare(b))
     .map(([date,v])=>({
       date,
-      close: parseFloat(v['5. adjusted close']),
-      open: parseFloat(v['1. open']),
-      high: parseFloat(v['2. high']),
-      low:  parseFloat(v['3. low']),
-      volume: parseFloat(v['6. volume']),
-      div:  parseFloat(v['7. dividend amount']),
+      close:  parseFloat(v['4. close']),
+      open:   parseFloat(v['1. open']),
+      high:   parseFloat(v['2. high']),
+      low:    parseFloat(v['3. low']),
+      volume: parseFloat(v['5. volume']),
+      div: 0,
     }));
   return arr;
 }
@@ -595,15 +607,19 @@ async function loadAll(){
 
   const tickers = [...new Set(STATE.positions.map(p=>p.ticker))];
   for(const [i,ticker] of tickers.entries()){
-    setLoading(true, `Lade Kursdaten: ${ticker} (${i+1}/${tickers.length})…`);
+    setLoading(true, `Lade ${ticker} (${i+1}/${tickers.length})…`);
     try{
       STATE.priceData[ticker] = await fetchDailyAdjusted(ticker);
-      const divs = STATE.priceData[ticker].filter(d=>d.div>0).map(d=>({date:d.date,amount:d.div}));
-      STATE.dividends[ticker] = divs;
-      // Zwischen Calls kurz warten (Rate-Limiting bei Free-Tier: 5 calls/min)
-      if(i<tickers.length-1) await new Promise(r=>setTimeout(r,13000));
+      STATE.dividends[ticker] = [];
+      // Free-Tier: max 5 Calls/min -> 15s Pause zwischen Calls, mit Countdown
+      if(i < tickers.length-1){
+        for(let s=15; s>0; s--){
+          setLoading(true, ticker+' geladen ✓ — naechster Ticker in '+s+'s (Rate-Limit)...');
+          await new Promise(r=>setTimeout(r,1000));
+        }
+      }
     }catch(e){
-      errors.push(`${ticker}: ${e.message}`);
+      errors.push(ticker+': '+e.message);
     }
   }
 
@@ -620,8 +636,21 @@ async function loadAll(){
     status.textContent = `✓ ${tickers.length} Ticker geladen`;
     status.className = 'key-status ok';
   } else {
-    status.textContent = `Fehler: ${errors.join('; ')}`;
+    status.textContent = `Teilweise Fehler (${errors.length} Ticker)`;
     status.className = 'key-status err';
+    // Fehler prominent oben in der Portfolio-Ansicht einblenden
+    const existing = document.getElementById('errorBox');
+    if(existing) existing.remove();
+    const box = document.createElement('div');
+    box.id='errorBox';
+    box.className='infobox warn';
+    box.style.borderColor='#7A2020';
+    box.innerHTML = '<strong style="color:var(--red);">Fehler beim Laden:</strong><br>' +
+      errors.map(e=>`<span class="mono" style="font-size:12px;">• ${e}</span>`).join('<br>') +
+      '<br><br><span style="color:var(--muted);font-size:12px;">Mögliche Ursachen: Ticker-Symbol falsch (z.B. <code>VWRL.L</code> statt <code>VWRL</code>), ' +
+      'Rate-Limit (25 Calls/Tag auf Free-Tier), oder API-Key abgelaufen.</span>';
+    document.getElementById('page-portfolio').insertBefore(box,
+      document.getElementById('page-portfolio').querySelector('.infobox'));
   }
   renderAll();
 }
